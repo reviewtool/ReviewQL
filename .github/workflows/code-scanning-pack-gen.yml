@@ -1,0 +1,101 @@
+name: Code Scanning Query Pack Generation
+
+on:
+  merge_group:
+  pull_request:
+    branches:
+      - main
+      - "rc/**"
+      - next
+
+  push:
+    branches:
+      - main
+      - "rc/**"
+      - next
+
+env:
+  XARGS_MAX_PROCS: 4
+
+jobs:
+  prepare-code-scanning-pack-matrix:
+    name: Prepare CodeQL Code Scanning pack matrix
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.export-code-scanning-pack-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Export Code Scanning pack matrix
+        id: export-code-scanning-pack-matrix
+        run: |
+          echo "::set-output name=matrix::$(
+            jq --compact-output '.supported_environment | {include: .}' supported_codeql_configs.json
+          )"
+
+  create-code-scanning-pack:
+    name: Create Code Scanning pack
+    needs: prepare-code-scanning-pack-matrix
+    runs-on: ubuntu-20.04-xl
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-code-scanning-pack-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Cache CodeQL
+        id: cache-codeql
+        uses: actions/cache@v2.1.3
+        with:
+          path: ${{ github.workspace }}/codeql_home
+          key: codeql-home-${{ matrix.os }}-${{ matrix.codeql_cli }}-${{ matrix.codeql_standard_library }}
+
+      - name: Install CodeQL
+        if: steps.cache-codeql.outputs.cache-hit != 'true'
+        uses: ./.github/actions/install-codeql
+        with:
+          codeql-cli-version: ${{ matrix.codeql_cli }}
+          codeql-stdlib-version: ${{ matrix.codeql_standard_library }}
+          codeql-home: ${{ github.workspace }}/codeql_home
+          add-to-path: false
+
+      - name: Install CodeQL packs
+        uses: ./.github/actions/install-codeql-packs
+        with:
+          cli_path: ${{ github.workspace }}/codeql_home/codeql
+
+      - name: Checkout external help files
+        continue-on-error: true
+        id: checkout-external-help-files
+        uses: actions/checkout@v2
+        with:
+          ssh-key: ${{ secrets.CODEQL_CODING_STANDARDS_HELP_KEY }}
+          repository: "github/codeql-coding-standards-help"
+          ref: ${{ github.head_ref }}
+          path: external-help-files
+
+      - name: Include external help files
+        if: ${{ steps.checkout-external-help-files.outcome == 'success' }}
+        run: |
+          pushd external-help-files
+          find . -name '*.md' -exec rsync -av --relative {} "$GITHUB_WORKSPACE" \;
+          popd
+
+      - name: Pre-compiling queries
+        env:
+          CODEQL_HOME: ${{ github.workspace }}/codeql_home
+        run: |
+          PATH=$PATH:$CODEQL_HOME/codeql
+
+          codeql query compile --threads 0 cpp
+          codeql query compile --threads 0 c
+
+          cd ..
+          zip -r codeql-coding-standards/code-scanning-cpp-query-pack.zip codeql-coding-standards/c/ codeql-coding-standards/cpp/ codeql-coding-standards/.codeqlmanifest.json codeql-coding-standards/supported_codeql_configs.json codeql-coding-standards/scripts/configuration codeql-coding-standards/scripts/reports codeql-coding-standards/scripts/shared codeql-coding-standards/scripts/guideline_recategorization codeql-coding-standards/scripts/shared codeql-coding-standards/scripts/schemas
+
+      - name: Upload GHAS Query Pack
+        uses: actions/upload-artifact@v2
+        with:
+          name: code-scanning-cpp-query-pack.zip
+          path: code-scanning-cpp-query-pack.zip
